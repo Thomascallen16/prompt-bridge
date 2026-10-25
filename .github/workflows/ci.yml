@@ -1,0 +1,52 @@
+name: Prompt Bridge CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prompt-bridge-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Syntax, metadata, and HTTP smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Setup Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - name: Validate server syntax
+        run: node --check server.js
+      - name: Validate package metadata
+        run: node --input-type=module -e "import fs from 'node:fs'; const p=JSON.parse(fs.readFileSync('package.json','utf8')); if(p.scripts?.start !== 'node server.js') process.exit(1); console.log('package metadata OK')"
+      - name: Smoke-test public routes and source-file isolation
+        shell: bash
+        run: |
+          set -euo pipefail
+          PORT=43127 node server.js > /tmp/prompt-bridge.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          for attempt in {1..20}; do
+            if curl --silent --fail http://127.0.0.1:43127/healthz >/tmp/prompt-bridge-health.txt; then break; fi
+            sleep 1
+          done
+          grep -qx 'ok' /tmp/prompt-bridge-health.txt
+          curl --silent --fail http://127.0.0.1:43127/ | grep -q '<title>Save State</title>'
+          curl --silent --fail http://127.0.0.1:43127/index.html | grep -q '<title>Save State</title>'
+          for path in /server.js /package.json /.env.example /README.md /.git/config /DOCS.md; do
+            status=$(curl --silent --output /dev/null --write-out '%{http_code}' "http://127.0.0.1:43127$path")
+            test "$status" = "404" || { echo "Expected 404 for $path, got $status"; exit 1; }
+          done
+          status=$(curl --silent --output /dev/null --write-out '%{http_code}' --request POST http://127.0.0.1:43127/)
+          test "$status" = "405"
